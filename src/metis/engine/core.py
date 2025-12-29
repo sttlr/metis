@@ -22,8 +22,9 @@ from metis.plugin_loader import load_plugins, discover_supported_language_names
 from metis.utils import (
     read_file_content,
 )
+from functools import partial
 from langchain_core.tools import StructuredTool
-from .tools import ReadFileTool, ListFilesTool, SearchFilesTool
+from .tools import ReadFileTool, ListFilesTool, SearchFilesTool, AskQuestionTool
 
 from .helpers import (
     summarize_changes,
@@ -124,7 +125,11 @@ class MetisEngine:
     def _get_review_graph(self):
         if self._review_graph is None:
             tools = create_langchain_tools(
-                self.codebase_path, self.load_metisignore(), self.disable_tools
+                self.codebase_path,
+                self.load_metisignore(),
+                self.disable_tools,
+                engine=self,
+                include_ask_tool=True,
             )
             self._review_graph = ReviewGraph(
                 llm_provider=self.llm_provider,
@@ -142,7 +147,10 @@ class MetisEngine:
     def _get_ask_graph(self):
         if self._ask_graph is None:
             tools = create_langchain_tools(
-                self.codebase_path, self.load_metisignore(), self.disable_tools
+                self.codebase_path,
+                self.load_metisignore(),
+                self.disable_tools,
+                include_ask_tool=False,
             )
             self._ask_graph = AskGraph(
                 llm_provider=self.llm_provider,
@@ -561,7 +569,13 @@ class MetisEngine:
         return qe_code, qe_docs
 
 
-def create_langchain_tools(codebase_path, metisignore_spec=None, disable_tools=False):
+def create_langchain_tools(
+    codebase_path,
+    metisignore_spec=None,
+    disable_tools=False,
+    engine=None,
+    include_ask_tool=False,
+):
     """
     Create and return a list of LangChain tools for file operations.
 
@@ -569,6 +583,8 @@ def create_langchain_tools(codebase_path, metisignore_spec=None, disable_tools=F
         codebase_path: Path to the codebase directory
         metisignore_spec: PathSpec for metisignore patterns
         disable_tools: If True, return an empty list
+        engine: MetisEngine instance for ask_question tool
+        include_ask_tool: If True, include the ask_question tool
 
     Returns:
         List of StructuredTool instances
@@ -609,5 +625,17 @@ def create_langchain_tools(codebase_path, metisignore_spec=None, disable_tools=F
             args_schema=search_tool.args_schema,
         )
     )
+
+    # Ask question (only if engine is provided and include_ask_tool is True)
+    if include_ask_tool and engine is not None:
+        ask_tool = AskQuestionTool()
+        tools.append(
+            StructuredTool.from_function(
+                func=partial(ask_tool.run, engine),
+                name=ask_tool.name,
+                description=ask_tool.description,
+                args_schema=ask_tool.args_schema,
+            )
+        )
 
     return tools
