@@ -11,6 +11,7 @@ metis_engine:
   max_token_length: 250000
   max_workers: 10
   embed_dim: 3072
+  disable_embedding_search: false
   hnsw_kwargs:
     hnsw_m: 16
     hnsw_ef_construction: 64

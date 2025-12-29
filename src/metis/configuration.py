@@ -127,6 +127,7 @@ def load_runtime_config(config_path=None, enable_psql=False):
         },
     )
     runtime["metisignore_file"] = engine_cfg.get("metisignore_file", None)
+    runtime["disable_embedding_search"] = engine_cfg.get("disable_embedding_search", False)
 
     # Query config
     query_cfg = cfg.get("query", {})

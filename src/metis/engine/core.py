@@ -65,6 +65,7 @@ class MetisEngine:
         for k in required_keys:
             setattr(self, k, kwargs[k])
 
+        self.disable_embedding_search = kwargs.get("disable_embedding_search", False)
         self.llm_provider = llm_provider
         self.doc_chunk_size = kwargs.get("doc_chunk_size", 1024)
         self.doc_chunk_overlap = kwargs.get("doc_chunk_overlap", 200)
@@ -125,6 +126,7 @@ class MetisEngine:
                 custom_guidance_precedence=self.custom_guidance_precedence,
                 llama_query_model=self.llama_query_model,
                 max_token_length=self.max_token_length,
+                disable_embedding_search=self.disable_embedding_search,
             )
         return self._review_graph
 
@@ -133,6 +135,7 @@ class MetisEngine:
             self._ask_graph = AskGraph(
                 llm_provider=self.llm_provider,
                 llama_query_model=self.llama_query_model,
+                disable_embedding_search=self.disable_embedding_search,
             )
         return self._ask_graph
 
@@ -530,6 +533,8 @@ class MetisEngine:
         logger.info("Index update complete based on the provided patch diff.")
 
     def _init_and_get_query_engines(self):
+        if self.disable_embedding_search:
+            return None, None
         self.vector_backend.init()
         qe_code, qe_docs = self.vector_backend.get_query_engines(
             self.llm_provider,

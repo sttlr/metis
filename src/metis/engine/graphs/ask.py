@@ -27,9 +27,10 @@ def ask_node_retrieve(state: AskState) -> AskState:
 
 
 class AskGraph:
-    def __init__(self, llm_provider, llama_query_model):
+    def __init__(self, llm_provider, llama_query_model, disable_embedding_search: bool):
         self.llm_provider = llm_provider
         self.llama_query_model = llama_query_model
+        self.disable_embedding_search = disable_embedding_search
         self._app = None
 
     def _get_app(self):
@@ -37,7 +38,17 @@ class AskGraph:
             return self._app
         graph = StateGraph(AskState)
 
-        graph.add_node("retrieve", partial(ask_node_retrieve))
+        if self.disable_embedding_search:
+            def empty_retrieve(state: AskState) -> AskState:
+                s: AskState = dict(state)
+                s["context"] = ""
+                s["code"] = ""
+                s["docs"] = ""
+                return s
+            graph.add_node("retrieve", empty_retrieve)
+        else:
+            graph.add_node("retrieve", partial(ask_node_retrieve))
+
         graph.set_entry_point("retrieve")
         graph.add_edge("retrieve", END)
         self._app = graph.compile()
