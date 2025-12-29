@@ -40,6 +40,17 @@ general_prompts:
     Question: {question}
 
     Answer:
+  review_gather_context: |-
+    You are an AI assistant tasked with gathering relevant context to perform a security review on the following code snippet. Your goal is to use the available tools to collect comprehensive information that is needed to perform a security review.
+
+    Instructions:
+    1. Analyze the code snippet and determine what information is needed.
+    2. Use the tools iteratively if needed, refining queries based on previous results.
+    3. When you have gathered sufficient context, respond with 'DONE'.
+
+    IMPORTANT: Do not perform the security review directly. Your goal is only to gather enough relevant context.
+
+    Code Snippet: {snippet}
 
 plugins:
   c:

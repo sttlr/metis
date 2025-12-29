@@ -4,6 +4,7 @@
 import logging
 from functools import partial
 
+from langchain_core.messages import SystemMessage, ToolMessage
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langgraph.graph import StateGraph, END
@@ -64,9 +65,6 @@ def _build_body_text(state: ReviewState) -> str:
             "SNIPPET:",
             snippet,
             "",
-            "CONTEXT:",
-            context,
-            "",
         ]
     else:
         original_file = state.get("original_file") or ""
@@ -77,6 +75,10 @@ def _build_body_text(state: ReviewState) -> str:
             "FILE_CHANGES:",
             snippet,
             "",
+        ]
+
+    if context:
+        sections += [
             "CONTEXT:",
             context,
             "",
@@ -107,6 +109,104 @@ def review_node_retrieve(state: ReviewState) -> ReviewState:
     new_state: ReviewState = dict(state)
     new_state["context"] = context
     return new_state
+
+
+def review_node_gather_context(
+    state: ReviewState,
+    chat_model,
+    tools,
+    plugin_config,
+    max_turns,
+) -> ReviewState:
+    snippet = state.get("snippet", "")
+    llm_with_tools = chat_model.bind_tools(tools)
+
+    prompt = plugin_config.get("general_prompts", {}).get("review_gather_context", "")
+    formatted_prompt = prompt.format(snippet=snippet)
+    messages = [SystemMessage(content=formatted_prompt)]
+
+    gathered_context = []
+    previous_tool_calls = None
+    turns = 0
+
+    while True:
+        turns += 1
+        if turns > max_turns:
+            logger.warning(
+                f"Max turns ({max_turns}) reached in review context gathering, breaking loop"
+            )
+            break
+        response = llm_with_tools.invoke(messages)
+        messages.append(response)
+
+        if response.tool_calls:
+            current_tool_calls = [
+                (
+                    tool_call.get("name", ""),
+                    tool_call.get("args", {}) or tool_call.get("arguments", {}),
+                )
+                for tool_call in response.tool_calls
+            ]
+            if previous_tool_calls == current_tool_calls:
+                for tool_call in response.tool_calls:
+                    tool_call_id = tool_call.get("id", "")
+                    error_msg = "Error: Repeated tool call detected. The same tool with the same arguments was requested again. Please vary your approach."
+                    messages.append(
+                        ToolMessage(content=error_msg, tool_call_id=tool_call_id)
+                    )
+                continue
+            previous_tool_calls = current_tool_calls
+
+            for tool_call in response.tool_calls:
+                tool_call_id = tool_call.get("id", "")
+                tool_name = tool_call.get("name", "")
+                tool_args = (
+                    tool_call.get("args", {})
+                    if "args" in tool_call
+                    else tool_call.get("arguments", {})
+                )
+
+                if not isinstance(tool_args, dict):
+                    error_msg = (
+                        f"Error: Invalid tool arguments format for tool '{tool_name}'"
+                    )
+                    messages.append(
+                        ToolMessage(content=error_msg, tool_call_id=tool_call_id)
+                    )
+                    continue
+
+                tool_instance = next((t for t in tools if t.name == tool_name), None)
+                if tool_instance:
+                    try:
+                        result = tool_instance.func(**tool_args)
+                        gathered_context.append(str(result))
+                        messages.append(
+                            ToolMessage(content=result, tool_call_id=tool_call_id)
+                        )
+                    except Exception as e:
+                        error_msg = (
+                            f"Error: Tool execution failed for '{tool_name}': {str(e)}"
+                        )
+                        messages.append(
+                            ToolMessage(content=error_msg, tool_call_id=tool_call_id)
+                        )
+                else:
+                    messages.append(
+                        ToolMessage(
+                            content=f"Error: Tool '{tool_name}' not found.",
+                            tool_call_id=tool_call_id,
+                        )
+                    )
+        else:
+            break
+
+    if response.content and response.content.strip():
+        gathered_context.append(str(response.content.strip()))
+
+    accumulated_context = "\n\n".join(gathered_context)
+    s = dict(state)
+    s["context"] = accumulated_context
+    return s
 
 
 def review_node_build_prompt(
@@ -184,6 +284,7 @@ class ReviewGraph:
         max_token_length,
         disable_embedding_search: bool,
         tools,
+        max_turns: int = 100,
     ):
         self.llm_provider = llm_provider
         self.plugin_config = plugin_config
@@ -193,12 +294,14 @@ class ReviewGraph:
         self.max_token_length = max_token_length
         self.disable_embedding_search = disable_embedding_search
         self.tools = tools
+        self.max_turns = max_turns
         self._schema_prompt_section = review_schema_prompt()
 
         self.report_prompt = self.plugin_config.get("general_prompts", {}).get(
             "security_review_report", ""
         )
 
+        self._chat_model = None
         self._structured_review_node = None
         self._fallback_review_node = None
         self._structured_review_node = self._create_structured_review_runnable()
@@ -207,6 +310,14 @@ class ReviewGraph:
                 "Unable to create review runnable; OpenAI-based provider required."
             )
         self._app_cache = {}
+
+    @property
+    def chat_model(self):
+        if self._chat_model is None:
+            self._chat_model = self.llm_provider.get_chat_model(
+                model=self.llama_query_model
+            )
+        return self._chat_model
 
     def _create_structured_review_runnable(self):
         get_chat_model = getattr(self.llm_provider, "get_chat_model", None)
@@ -241,16 +352,9 @@ class ReviewGraph:
             return cached
 
         graph = StateGraph(ReviewState)
-        if self.disable_embedding_search:
 
-            def empty_retrieve(state: ReviewState) -> ReviewState:
-                new_state: ReviewState = dict(state)
-                new_state["context"] = ""
-                return new_state
+        retrieve = review_node_retrieve
 
-            retrieve = empty_retrieve
-        else:
-            retrieve = review_node_retrieve
         build_prompt = partial(
             review_node_build_prompt,
             language_prompts=language_prompts,
@@ -267,13 +371,37 @@ class ReviewGraph:
         )
         parse = review_node_parse
 
-        graph.add_node("retrieve", retrieve)
+        if self.tools:
+            graph.add_node(
+                "gather_context",
+                partial(
+                    review_node_gather_context,
+                    chat_model=self.chat_model,
+                    tools=self.tools,
+                    plugin_config=self.plugin_config,
+                    max_turns=self.max_turns,
+                ),
+            )
         graph.add_node("build_prompt", build_prompt)
         graph.add_node("review", review)
         graph.add_node("parse", parse)
 
-        graph.set_entry_point("retrieve")
-        graph.add_edge("retrieve", "build_prompt")
+        if not self.disable_embedding_search:
+            graph.set_entry_point("retrieve")
+            graph.add_node("retrieve", retrieve)
+
+            if self.tools:
+                graph.add_edge("retrieve", "gather_context")
+                graph.add_edge("gather_context", "build_prompt")
+            else:
+                graph.add_edge("retrieve", "build_prompt")
+        else:
+            if self.tools:
+                graph.set_entry_point("gather_context")
+                graph.add_edge("gather_context", "build_prompt")
+            else:
+                graph.set_entry_point("build_prompt")
+
         graph.add_edge("build_prompt", "review")
         graph.add_edge("review", "parse")
         graph.add_edge("parse", END)

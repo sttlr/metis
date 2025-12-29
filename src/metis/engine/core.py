@@ -135,6 +135,7 @@ class MetisEngine:
                 max_token_length=self.max_token_length,
                 disable_embedding_search=self.disable_embedding_search,
                 tools=tools,
+                max_turns=self.max_turns,
             )
         return self._review_graph
 
