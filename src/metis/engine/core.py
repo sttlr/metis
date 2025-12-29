@@ -22,6 +22,8 @@ from metis.plugin_loader import load_plugins, discover_supported_language_names
 from metis.utils import (
     read_file_content,
 )
+from langchain_core.tools import StructuredTool
+from .tools import ReadFileTool, ListFilesTool, SearchFilesTool
 
 from .helpers import (
     summarize_changes,
@@ -66,6 +68,7 @@ class MetisEngine:
             setattr(self, k, kwargs[k])
 
         self.disable_embedding_search = kwargs.get("disable_embedding_search", False)
+        self.disable_tools = kwargs.get("disable_tools", False)
         self.llm_provider = llm_provider
         self.doc_chunk_size = kwargs.get("doc_chunk_size", 1024)
         self.doc_chunk_overlap = kwargs.get("doc_chunk_overlap", 200)
@@ -119,6 +122,9 @@ class MetisEngine:
 
     def _get_review_graph(self):
         if self._review_graph is None:
+            tools = create_langchain_tools(
+                self.codebase_path, self.load_metisignore(), self.disable_tools
+            )
             self._review_graph = ReviewGraph(
                 llm_provider=self.llm_provider,
                 plugin_config=self.plugin_config,
@@ -127,15 +133,20 @@ class MetisEngine:
                 llama_query_model=self.llama_query_model,
                 max_token_length=self.max_token_length,
                 disable_embedding_search=self.disable_embedding_search,
+                tools=tools,
             )
         return self._review_graph
 
     def _get_ask_graph(self):
         if self._ask_graph is None:
+            tools = create_langchain_tools(
+                self.codebase_path, self.load_metisignore(), self.disable_tools
+            )
             self._ask_graph = AskGraph(
                 llm_provider=self.llm_provider,
                 llama_query_model=self.llama_query_model,
                 disable_embedding_search=self.disable_embedding_search,
+                tools=tools,
             )
         return self._ask_graph
 
@@ -544,3 +555,55 @@ class MetisEngine:
         if not qe_code or not qe_docs:
             raise QueryEngineInitError()
         return qe_code, qe_docs
+
+
+def create_langchain_tools(codebase_path, metisignore_spec=None, disable_tools=False):
+    """
+    Create and return a list of LangChain tools for file operations.
+
+    Args:
+        codebase_path: Path to the codebase directory
+        metisignore_spec: PathSpec for metisignore patterns
+        disable_tools: If True, return an empty list
+
+    Returns:
+        List of StructuredTool instances
+    """
+    if disable_tools:
+        return []
+    tools = []
+
+    # Read file
+    read_tool = ReadFileTool(codebase_path)
+    tools.append(
+        StructuredTool.from_function(
+            func=read_tool.run,
+            name=read_tool.name,
+            description=read_tool.description,
+            args_schema=read_tool.args_schema,
+        )
+    )
+
+    # List files
+    list_tool = ListFilesTool(codebase_path, metisignore_spec)
+    tools.append(
+        StructuredTool.from_function(
+            func=list_tool.run,
+            name=list_tool.name,
+            description=list_tool.description,
+            args_schema=list_tool.args_schema,
+        )
+    )
+
+    # Search files
+    search_tool = SearchFilesTool(codebase_path)
+    tools.append(
+        StructuredTool.from_function(
+            func=search_tool.run,
+            name=search_tool.name,
+            description=search_tool.description,
+            args_schema=search_tool.args_schema,
+        )
+    )
+
+    return tools

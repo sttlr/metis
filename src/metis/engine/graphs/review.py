@@ -183,6 +183,7 @@ class ReviewGraph:
         llama_query_model,
         max_token_length,
         disable_embedding_search: bool,
+        tools,
     ):
         self.llm_provider = llm_provider
         self.plugin_config = plugin_config
@@ -191,6 +192,7 @@ class ReviewGraph:
         self.llama_query_model = llama_query_model
         self.max_token_length = max_token_length
         self.disable_embedding_search = disable_embedding_search
+        self.tools = tools
         self._schema_prompt_section = review_schema_prompt()
 
         self.report_prompt = self.plugin_config.get("general_prompts", {}).get(
@@ -240,10 +242,12 @@ class ReviewGraph:
 
         graph = StateGraph(ReviewState)
         if self.disable_embedding_search:
+
             def empty_retrieve(state: ReviewState) -> ReviewState:
                 new_state: ReviewState = dict(state)
                 new_state["context"] = ""
                 return new_state
+
             retrieve = empty_retrieve
         else:
             retrieve = review_node_retrieve

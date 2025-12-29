@@ -24,7 +24,12 @@ class DummyRetriever:
 
 
 def test_ask_graph_returns_code_and_docs():
-    g = AskGraph(llm_provider=object(), llama_query_model="test-model")
+    g = AskGraph(
+        llm_provider=object(),
+        llama_query_model="test-model",
+        disable_embedding_search=False,
+        tools=[],
+    )
     req = {
         "question": "What is here?",
         "retriever_code": DummyRetriever("code"),
