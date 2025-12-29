@@ -128,15 +128,21 @@ def run_update(engine, patch_file, args):
 
 def run_ask(engine, question):
     answer = with_spinner("Thinking...", engine.ask_question, question)
-    print_console("[bold magenta]Metis Answer:[/bold magenta]\n")
     if isinstance(answer, dict):
-        if "code" in answer:
+        if "code" in answer and answer["code"]:
             print_console(
-                f"[bold yellow]Code Context:[/bold yellow] {escape(safe_decode_unicode(answer['code']))} \n"
+                f"[bold yellow]Code Context:[/bold yellow] {escape(safe_decode_unicode(answer['code']))}\n"
             )
-        if "docs" in answer:
+        if "docs" in answer and answer["docs"]:
             print_console(
-                f"[bold blue]Documentation Context:[/bold blue] {escape(safe_decode_unicode(answer['docs']))}"
+                f"[bold blue]Documentation Context:[/bold blue] {escape(safe_decode_unicode(answer['docs']))}\n"
             )
+        if "context" in answer and answer["context"]:
+            print_console(
+                f"[bold red]Context:[/bold red] {escape(safe_decode_unicode(answer['context']))} \n"
+            )
+        if "answer" in answer and answer["answer"]:
+            print_console("[bold magenta]Metis Answer:[/bold magenta]\n")
+            print_console(f"{escape(safe_decode_unicode(answer['answer']))}\n")
     else:
         print_console(escape(str(answer)))

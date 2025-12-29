@@ -69,6 +69,7 @@ class MetisEngine:
 
         self.disable_embedding_search = kwargs.get("disable_embedding_search", False)
         self.disable_tools = kwargs.get("disable_tools", False)
+        self.max_turns = kwargs.get("max_turns", 100)
         self.llm_provider = llm_provider
         self.doc_chunk_size = kwargs.get("doc_chunk_size", 1024)
         self.doc_chunk_overlap = kwargs.get("doc_chunk_overlap", 200)
@@ -145,8 +146,10 @@ class MetisEngine:
             self._ask_graph = AskGraph(
                 llm_provider=self.llm_provider,
                 llama_query_model=self.llama_query_model,
-                disable_embedding_search=self.disable_embedding_search,
+                plugin_config=self.plugin_config,
                 tools=tools,
+                max_turns=self.max_turns,
+                disable_embedding_search=self.disable_embedding_search,
             )
         return self._ask_graph
 

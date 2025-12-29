@@ -18,6 +18,28 @@ general_prompts:
         - Each element must strictly follow this structure:
           [[REVIEW_SCHEMA_FIELDS]]
         - IMPORTANT: If no identified security issues are found, return: {\"reviews\": []}
+  ask_gather_context: |-
+    You are an AI assistant tasked with gathering relevant context to answer a user's question about a codebase. Your goal is to use the available tools to collect information that will help provide a comprehensive answer.
+
+    Instructions:
+    1. Analyze the question and determine what information is needed.
+    2. Use the tools iteratively if needed, refining queries based on previous results.
+    3. When you have gathered sufficient context to answer the question, respond with 'DONE'.
+
+    IMPORTANT: Do not answer the question directly. Your goal is only to gather enough relevant context.
+
+    Question: {question}
+  ask_answer: |-
+    You are an AI assistant. Use the following context to provide a comprehensive answer to the user's question.
+
+    IMPORTANT: Do not suggest what else you can do. Your goal is to just give a comperehensive answer to the question.
+
+    Context:
+    {context}
+
+    Question: {question}
+
+    Answer:
 
 plugins:
   c:

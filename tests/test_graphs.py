@@ -24,11 +24,30 @@ class DummyRetriever:
 
 
 def test_ask_graph_returns_code_and_docs():
+    class MockLLMProvider:
+        def get_chat_model(self, model):
+            class MockChatModel:
+                def bind_tools(self, tools):
+                    return self
+
+                def invoke(self, messages):
+                    class MockResponse:
+                        content = "DONE"
+                        tool_calls = []
+
+                    return MockResponse()
+
+            return MockChatModel()
+
     g = AskGraph(
-        llm_provider=object(),
+        llm_provider=MockLLMProvider(),
         llama_query_model="test-model",
-        disable_embedding_search=False,
+        plugin_config={
+            "general_prompts": {"ask_gather_context": "Gather context for {question}"}
+        },
         tools=[],
+        max_turns=50,
+        disable_embedding_search=False,
     )
     req = {
         "question": "What is here?",
@@ -37,9 +56,7 @@ def test_ask_graph_returns_code_and_docs():
     }
     out = g.ask(req)  # type: ignore[arg-type]
     assert isinstance(out, dict)
-    assert "code" in out and "docs" in out
-    assert "code context" in out["code"] or "code" in out["code"].lower()
-    assert "docs" in out["docs"].lower()
+    assert "code" in out and "docs" in out and "answer" in out and "context" in out
 
 
 def test_review_nodes_pipeline_parses():

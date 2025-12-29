@@ -13,6 +13,7 @@ metis_engine:
   embed_dim: 3072
   disable_embedding_search: false
   disable_tools: false
+  max_turns: 100
   hnsw_kwargs:
     hnsw_m: 16
     hnsw_ef_construction: 64
