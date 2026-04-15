@@ -129,7 +129,8 @@ class MetisEngine:
                 self.load_metisignore(),
                 self.disable_tools,
                 engine=self,
-                include_ask_tool=True,
+                # include_ask_tool=True,
+                include_ask_tool=False,
             )
             self._review_graph = ReviewGraph(
                 llm_provider=self.llm_provider,
