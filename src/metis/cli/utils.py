@@ -1,16 +1,16 @@
-# SPDX-FileCopyrightText: Copyright 2025 Arm Limited and/or its affiliates <open-source-office@arm.com>
+# SPDX-FileCopyrightText: Copyright 2025-2026 Arm Limited and/or its affiliates <open-source-office@arm.com>
 # SPDX-License-Identifier: Apache-2.0
 
 import importlib.metadata
 import json
 import logging
-import os
 import re
 import warnings
 from pathlib import Path
 from importlib.resources import files
 
 from rich.console import Console
+from rich.errors import MarkupError
 from rich.markup import escape
 from rich.progress import (
     Progress,
@@ -22,7 +22,9 @@ from rich.progress import (
     TimeRemainingColumn,
 )
 
+from metis.engine.options import ReviewOptions
 from .exporters import export_csv, export_html, export_sarif
+from metis.sarif.utils import create_fingerprint
 
 try:
     METIS_VERSION = importlib.metadata.version("metis")
@@ -95,8 +97,94 @@ def configure_logger(logger, args):
 
 
 def print_console(message, quiet=False, **kwargs):
-    if not quiet:
+    if quiet:
+        return
+    try:
         console.print(message, **kwargs)
+    except MarkupError:
+        fallback_kwargs = dict(kwargs)
+        fallback_kwargs["markup"] = False
+        console.print(str(message), **fallback_kwargs)
+
+
+def _usage_triplet(summary):
+    if not isinstance(summary, dict):
+        return 0, 0, 0
+    input_tokens = int(summary.get("input_tokens") or 0)
+    output_tokens = int(summary.get("output_tokens") or 0)
+    total_tokens = int(summary.get("total_tokens") or (input_tokens + output_tokens))
+    return input_tokens, output_tokens, total_tokens
+
+
+def _format_usage_triplet(summary):
+    input_tokens, output_tokens, total_tokens = _usage_triplet(summary)
+    return (
+        f"(input: {input_tokens:,} · "
+        f"output: {output_tokens:,} · "
+        f"total: {total_tokens:,})"
+    )
+
+
+def _iter_operation_summaries(summary):
+    if not isinstance(summary, dict):
+        return []
+    by_operation = summary.get("by_operation")
+    if not isinstance(by_operation, dict):
+        return []
+    items = [
+        (str(name), op_summary)
+        for name, op_summary in by_operation.items()
+        if isinstance(op_summary, dict) and _usage_triplet(op_summary)[2] > 0
+    ]
+    return sorted(
+        items,
+        key=lambda item: (-_usage_triplet(item[1])[2], item[0]),
+    )
+
+
+def _print_operation_breakdown(summary, quiet=False):
+    items = _iter_operation_summaries(summary)
+    if len(items) <= 1:
+        return
+    print_console("[bold]Breakdown by operation[/bold]", quiet=quiet)
+    for operation_name, operation_summary in items:
+        print_console(
+            f"- {escape(operation_name)} {_format_usage_triplet(operation_summary)}",
+            quiet=quiet,
+        )
+
+
+def print_usage_summary(command_label, current_summary, total_summary, quiet=False):
+    print_console(
+        f"[bold cyan]Token usage ({escape(str(command_label))})[/bold cyan]",
+        quiet=quiet,
+    )
+    print_console(
+        f"Current {_format_usage_triplet(current_summary)}",
+        quiet=quiet,
+    )
+    _print_operation_breakdown(current_summary, quiet=quiet)
+
+
+def print_final_usage_summary(
+    total_summary,
+    saved_path=None,
+    quiet=False,
+    *,
+    include_totals=True,
+):
+    if include_totals:
+        print_console("[bold cyan]Session token usage[/bold cyan]", quiet=quiet)
+        print_console(
+            f"Run total {_format_usage_triplet(total_summary)}",
+            quiet=quiet,
+        )
+        _print_operation_breakdown(total_summary, quiet=quiet)
+    if saved_path:
+        print_console(
+            f"[blue]Usage saved to {escape(str(saved_path))}[/blue]",
+            quiet=quiet,
+        )
 
 
 def with_spinner(task_description, fn, *args, quiet=False, **kwargs):
@@ -143,27 +231,16 @@ def with_timer(task_description, fn, *args, quiet=False, **kwargs):
     return result
 
 
-def collect_reviews(engine):
-    return {"reviews": [r for r in engine.review_code() if r]}
+def collect_reviews(engine, options: ReviewOptions | None = None):
+    reviews = engine.review.review_code(options=options)
+    return {"reviews": [r for r in reviews if r]}
 
 
 def iterate_with_progress(total, iterable):
     results = []
     if total <= 0:
         return results
-    with Progress(
-        SpinnerColumn(style="cyan"),
-        BarColumn(bar_width=None, complete_style="green", finished_style="green"),
-        TaskProgressColumn(),
-        TextColumn("[bright_black]elapsed"),
-        TimeElapsedColumn(),
-        TextColumn("[bright_black]eta"),
-        TimeRemainingColumn(),
-        transient=True,
-        console=console,
-        redirect_stdout=True,
-        redirect_stderr=True,
-    ) as progress:
+    with build_standard_progress(transient=True) as progress:
         task = progress.add_task("", total=total)
         for item in iterable:
             if item is not None:
@@ -176,26 +253,28 @@ def iterate_with_progress(total, iterable):
     return results
 
 
+def build_standard_progress(*, transient: bool):
+    return Progress(
+        SpinnerColumn(style="cyan"),
+        BarColumn(bar_width=None, complete_style="green", finished_style="green"),
+        TaskProgressColumn(),
+        TextColumn("[bright_black]elapsed"),
+        TimeElapsedColumn(),
+        TextColumn("[bright_black]eta"),
+        TimeRemainingColumn(),
+        transient=transient,
+        console=console,
+        redirect_stdout=True,
+        redirect_stderr=True,
+    )
+
+
 def count_index_items(engine):
-    """
-    Count total items to index (code + docs files).
-    Used to size the progress bar for verbose indexing.
-    """
-
-    docs_exts = engine.plugin_config.get("docs", {})
-    code_count = len(engine.get_code_files())
-
-    doc_count = 0
-    base_path = os.path.abspath(engine.codebase_path)
-    for _, _, _files in os.walk(base_path):
-        for f in _files:
-            if os.path.splitext(f)[1].lower() in docs_exts:
-                doc_count += 1
-
-    return code_count + doc_count
+    """Count total items to index via the indexing domain surface."""
+    return engine.indexing.count_index_items()
 
 
-def save_output(output_files, data, quiet=False):
+def save_output(output_files, data, quiet=False, sarif_payload=None):
     if not output_files:
         return
 
@@ -203,8 +282,12 @@ def save_output(output_files, data, quiet=False):
         files = [output_files]
     else:
         files = list(output_files)
-    json_payload = data
-    sarif_payload = None
+    json_payload = (
+        _merge_triage_annotations(data, sarif_payload)
+        if sarif_payload is not None
+        else data
+    )
+    sarif_payload_local = sarif_payload
 
     def _write_payload(path, payload, label):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -222,7 +305,7 @@ def save_output(output_files, data, quiet=False):
         if suffix == ".html":
             try:
                 html_path = export_html(
-                    data, output_path, REPORT_TEMPLATE, METIS_VERSION
+                    json_payload, output_path, REPORT_TEMPLATE, METIS_VERSION
                 )
                 print_console(
                     f"[blue]HTML report saved to {escape(str(html_path))}[/blue]",
@@ -235,8 +318,8 @@ def save_output(output_files, data, quiet=False):
 
         if suffix == ".sarif":
             try:
-                sarif_path, sarif_payload = export_sarif(
-                    data, output_path, sarif_payload
+                sarif_path, sarif_payload_local = export_sarif(
+                    data, output_path, sarif_payload_local
                 )
                 print_console(
                     f"[blue]SARIF report saved to {escape(str(sarif_path))}[/blue]",
@@ -252,7 +335,7 @@ def save_output(output_files, data, quiet=False):
 
         if suffix == ".csv":
             try:
-                csv_path = export_csv(data, output_path)
+                csv_path = export_csv(json_payload, output_path)
                 print_console(
                     f"[blue]CSV report saved to {escape(str(csv_path))}[/blue]",
                     quiet,
@@ -267,6 +350,198 @@ def save_output(output_files, data, quiet=False):
 
         # default to JSON
         _write_payload(output_path, json_payload, "Results")
+
+
+def _merge_triage_annotations(report_data, sarif_payload):
+    if not isinstance(report_data, dict):
+        return report_data
+    reviews = report_data.get("reviews")
+    if not isinstance(reviews, list):
+        return report_data
+    runs = sarif_payload.get("runs") if isinstance(sarif_payload, dict) else None
+    if not isinstance(runs, list):
+        return report_data
+
+    sarif_results = []
+    for run in runs:
+        if not isinstance(run, dict):
+            continue
+        results = run.get("results")
+        if not isinstance(results, list):
+            continue
+        sarif_results.extend(results)
+
+    issue_refs = []
+    for file_entry in reviews:
+        if not isinstance(file_entry, dict):
+            continue
+        file_name = str(file_entry.get("file") or file_entry.get("file_path") or "")
+        issues = file_entry.get("reviews")
+        if not isinstance(issues, list):
+            continue
+        for issue in issues:
+            if isinstance(issue, dict):
+                issue_refs.append((issue, file_name))
+
+    if not sarif_results or not issue_refs:
+        return report_data
+
+    indexed = []
+    fp_map: dict[str, list[int]] = {}
+    file_line_issue_map: dict[tuple[str, int, str], list[int]] = {}
+    file_line_map: dict[tuple[str, int], list[int]] = {}
+    file_issue_map: dict[tuple[str, str], list[int]] = {}
+    file_line_rule_map: dict[tuple[str, int, str], list[int]] = {}
+    file_rule_issue_map: dict[tuple[str, str, str], list[int]] = {}
+
+    for idx, result in enumerate(sarif_results):
+        if not isinstance(result, dict):
+            continue
+        properties = result.get("properties")
+        if not isinstance(properties, dict):
+            continue
+
+        file_name, line_number = _extract_sarif_location(result)
+        issue_text = _extract_sarif_issue_text(result)
+        rule_id = _extract_sarif_rule_id(result)
+        fingerprint = _extract_sarif_fingerprint(result)
+        indexed.append((idx, properties))
+        if fingerprint:
+            fp_map.setdefault(fingerprint, []).append(idx)
+        if file_name and line_number > 0 and rule_id:
+            file_line_rule_map.setdefault((file_name, line_number, rule_id), []).append(
+                idx
+            )
+        if file_name and line_number > 0 and issue_text:
+            file_line_issue_map.setdefault(
+                (file_name, line_number, issue_text), []
+            ).append(idx)
+        if file_name and rule_id and issue_text:
+            file_rule_issue_map.setdefault((file_name, rule_id, issue_text), []).append(
+                idx
+            )
+        if file_name and line_number > 0:
+            file_line_map.setdefault((file_name, line_number), []).append(idx)
+        if file_name and issue_text:
+            file_issue_map.setdefault((file_name, issue_text), []).append(idx)
+
+    unused = {idx for idx, _ in indexed}
+
+    def _take_from(mapping, key):
+        entries = mapping.get(key)
+        if not entries:
+            return None
+        while entries:
+            candidate = entries.pop(0)
+            if candidate in unused:
+                return candidate
+        return None
+
+    properties_by_idx = {idx: props for idx, props in indexed}
+
+    for issue, file_name in issue_refs:
+        line_number = _normalize_issue_line(issue.get("line_number"))
+        issue_text = str(issue.get("issue") or issue.get("title") or "").strip()
+        issue_rule = str(issue.get("rule_id") or issue.get("ruleId") or "").strip()
+        fingerprint = ""
+        if file_name and line_number > 0:
+            fingerprint = create_fingerprint(file_name, line_number, "AI001")
+
+        matchers = []
+        if fingerprint:
+            matchers.append((fp_map, fingerprint))
+        if file_name and line_number > 0 and issue_rule:
+            matchers.append((file_line_rule_map, (file_name, line_number, issue_rule)))
+        if file_name and line_number > 0 and issue_text:
+            matchers.append((file_line_issue_map, (file_name, line_number, issue_text)))
+        if file_name and issue_rule and issue_text:
+            matchers.append((file_rule_issue_map, (file_name, issue_rule, issue_text)))
+        if file_name and line_number > 0:
+            matchers.append((file_line_map, (file_name, line_number)))
+        if file_name and issue_text:
+            matchers.append((file_issue_map, (file_name, issue_text)))
+
+        match_idx = None
+        for mapping, key in matchers:
+            match_idx = _take_from(mapping, key)
+            if match_idx is not None:
+                break
+        if match_idx is None:
+            continue
+
+        unused.discard(match_idx)
+        properties = properties_by_idx.get(match_idx)
+        if not properties:
+            continue
+        _apply_triage_properties(issue, properties)
+
+    return report_data
+
+
+def _normalize_issue_line(raw_line) -> int:
+    try:
+        parsed = int(raw_line)
+    except Exception:
+        return 1
+    return parsed if parsed > 0 else 1
+
+
+def _extract_sarif_fingerprint(result: dict) -> str:
+    partial = result.get("partialFingerprints")
+    if not isinstance(partial, dict):
+        return ""
+    return str(partial.get("primaryLocationLineHash") or "").strip()
+
+
+def _extract_sarif_location(result: dict) -> tuple[str, int]:
+    locations = result.get("locations")
+    if not isinstance(locations, list) or not locations:
+        return "", 1
+    first = locations[0]
+    if not isinstance(first, dict):
+        return "", 1
+    physical = first.get("physicalLocation")
+    if not isinstance(physical, dict):
+        return "", 1
+    artifact = physical.get("artifactLocation")
+    file_name = ""
+    if isinstance(artifact, dict):
+        file_name = str(artifact.get("uri") or "")
+    region = physical.get("region")
+    properties = result.get("properties")
+    if isinstance(properties, dict):
+        reported_line = properties.get("reportedLineNumber")
+        if reported_line is not None:
+            return file_name, _normalize_issue_line(reported_line)
+    if not isinstance(region, dict):
+        return file_name, 1
+    return file_name, _normalize_issue_line(region.get("startLine"))
+
+
+def _extract_sarif_rule_id(result: dict) -> str:
+    return str(result.get("ruleId") or "").strip()
+
+
+def _extract_sarif_issue_text(result: dict) -> str:
+    message = result.get("message")
+    if isinstance(message, dict):
+        return str(message.get("text") or "").strip()
+    if isinstance(message, str):
+        return message.strip()
+    return ""
+
+
+def _apply_triage_properties(issue: dict, properties: dict) -> None:
+    if "metisTriaged" in properties:
+        issue["metisTriaged"] = bool(properties.get("metisTriaged"))
+    if "metisTriageStatus" in properties:
+        issue["metisTriageStatus"] = str(properties.get("metisTriageStatus") or "")
+    if "metisTriageReason" in properties:
+        issue["metisTriageReason"] = str(properties.get("metisTriageReason") or "")
+    if "metisTriageTimestamp" in properties:
+        issue["metisTriageTimestamp"] = str(
+            properties.get("metisTriageTimestamp") or ""
+        )
 
 
 def check_file_exists(file_path, quiet=False):

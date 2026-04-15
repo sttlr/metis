@@ -1,19 +1,18 @@
-# SPDX-FileCopyrightText: Copyright 2025 Arm Limited and/or its affiliates <open-source-office@arm.com>
+# SPDX-FileCopyrightText: Copyright 2025-2026 Arm Limited and/or its affiliates <open-source-office@arm.com>
 # SPDX-License-Identifier: Apache-2.0
 
 import argparse
+from datetime import datetime
 import logging
 from pathlib import Path
-from datetime import datetime
 
-from rich.console import Console
 from rich.markup import escape
 from prompt_toolkit import prompt
-from prompt_toolkit.completion import WordCompleter
 from prompt_toolkit.history import InMemoryHistory
 
 from metis.configuration import load_runtime_config
 from metis.engine import MetisEngine
+from metis.usage import UsageRuntime
 from metis.utils import read_file_content
 from metis.providers.registry import get_provider
 
@@ -23,42 +22,22 @@ except ImportError:
     pass
 
 
-from .commands import (
-    run_index,
-    run_ask,
-    run_review,
-    run_file_review,
-    run_review_code,
-    run_update,
-    show_help,
-    show_version,
-)
+from .command_registry import COMMANDS, completer
+from .command_runtime import CommandRuntime
 from .utils import (
     configure_logger,
     PG_SUPPORTED,
     build_pg_backend,
     build_chroma_backend,
     print_console,
+    print_usage_summary,
+    print_final_usage_summary,
 )
 
 logging.captureWarnings(True)
 logging.getLogger().setLevel(logging.ERROR)
-
-console = Console()
 logger = logging.getLogger("metis")
-
-COMMANDS = {
-    "index": run_index,
-    "review_patch": run_review,
-    "review_code": run_review_code,
-    "update": run_update,
-    "review_file": run_file_review,
-    "ask": run_ask,
-    "help": show_help,
-    "version": show_version,
-    "exit": None,
-}
-completer = WordCompleter(list(COMMANDS), ignore_case=True)
+EXIT_REQUESTED = object()
 
 
 def determine_output_file(cmd, args, cmd_args):
@@ -76,6 +55,10 @@ def determine_output_file(cmd, args, cmd_args):
         args.output_file = overrides
         return
 
+    if cmd == "triage":
+        args.output_file = existing_outputs
+        return
+
     if existing_outputs:
         args.output_file = existing_outputs
         return
@@ -85,34 +68,244 @@ def determine_output_file(cmd, args, cmd_args):
     args.output_file = [f"results/{cmd}_{timestamp}.json"]
 
 
+def resolve_custom_prompt(args):
+    custom_prompt_text = None
+    if args.custom_prompt:
+        pf = Path(args.custom_prompt)
+        if pf.is_file() and pf.suffix.lower() in {".md", ".txt"}:
+            custom_prompt_text = read_file_content(str(pf))
+        else:
+            print_console(
+                f"[yellow]Warning:[/yellow] Ignoring --custom-prompt '{escape(str(pf))}'. It must exist and have .md or .txt extension.",
+                args.quiet,
+            )
+    if custom_prompt_text is None:
+        metis_md = Path(args.codebase_path) / ".metis.md"
+        if metis_md.is_file():
+            custom_prompt_text = read_file_content(str(metis_md))
+    return custom_prompt_text
+
+
+def build_engine(args, runtime):
+    llm_provider_name = runtime.get("llm_provider_name", "openai")
+    provider_cls = get_provider(llm_provider_name)
+    llm_provider = provider_cls(runtime)
+
+    usage_runtime = UsageRuntime(args.codebase_path)
+    embed_model_code = llm_provider.get_embed_model_code(
+        **usage_runtime.hooks.embed_model_kwargs()
+    )
+    embed_model_docs = llm_provider.get_embed_model_docs(
+        **usage_runtime.hooks.embed_model_kwargs()
+    )
+
+    if args.backend == "postgres":
+        vector_backend = build_pg_backend(
+            args, runtime, embed_model_code, embed_model_docs
+        )
+    else:
+        vector_backend = build_chroma_backend(
+            args, runtime, embed_model_code, embed_model_docs
+        )
+
+    engine = MetisEngine(
+        codebase_path=args.codebase_path,
+        llm_provider=llm_provider,
+        vector_backend=vector_backend,
+        custom_prompt_text=resolve_custom_prompt(args),
+        usage_runtime=usage_runtime,
+        **runtime,
+    )
+    return engine, vector_backend
+
+
+def finalize_cli_session(engine, args):
+    if getattr(args, "_metis_usage_finalized", False):
+        return None
+    args._metis_usage_finalized = True
+    if engine is None or not hasattr(engine, "has_usage") or not engine.has_usage():
+        return None
+    saved_path = engine.save_usage_summary()
+    completed_commands = None
+    usage_runtime = getattr(engine, "usage_runtime", None)
+    completed_commands_fn = getattr(usage_runtime, "completed_commands", None)
+    if callable(completed_commands_fn):
+        try:
+            completed_commands = completed_commands_fn()
+        except Exception:
+            completed_commands = None
+    include_totals = not (
+        bool(getattr(args, "non_interactive", False))
+        and isinstance(completed_commands, list)
+        and len(completed_commands) == 1
+    )
+    print_final_usage_summary(
+        engine.usage_totals(),
+        saved_path=saved_path,
+        quiet=args.quiet,
+        include_totals=include_totals,
+    )
+    return saved_path
+
+
+def finalize_cli_session_and_close(engine, args, farewell):
+    try:
+        finalize_cli_session(engine, args)
+    finally:
+        if farewell:
+            print_console(farewell, args.quiet)
+        close_fn = getattr(engine, "close", None)
+        if callable(close_fn):
+            close_fn()
+
+
+def _command_requests_ignore_index(args, cmd_args):
+    filtered_args = []
+    ignore_index = bool(getattr(args, "ignore_index", False))
+    for arg in cmd_args:
+        if arg == "--ignore-index":
+            ignore_index = True
+            continue
+        filtered_args.append(arg)
+    return filtered_args, ignore_index
+
+
+def _prepare_command_runtime(cmd, cmd_args, args):
+    spec = COMMANDS[cmd]
+    filtered_args, ignore_index = _command_requests_ignore_index(args, cmd_args)
+    if not spec.validate_options(cmd, args, ignore_index_requested=ignore_index):
+        return None
+
+    if spec.index_policy == "none":
+        return CommandRuntime(
+            command=cmd,
+            command_args=filtered_args,
+            use_retrieval_context=False,
+        )
+
+    if ignore_index and spec.index_policy == "optional":
+        return CommandRuntime(
+            command=cmd,
+            command_args=filtered_args,
+            use_retrieval_context=False,
+        )
+
+    return CommandRuntime(
+        command=cmd,
+        command_args=filtered_args,
+        use_retrieval_context=True,
+    )
+
+
+def _interactive_command_ignores_index(cmd, cmd_args, args):
+    spec = COMMANDS.get(cmd)
+    if spec is None or spec.index_policy != "optional":
+        return False
+    _filtered_args, ignore_index = _command_requests_ignore_index(args, cmd_args)
+    return ignore_index
+
+
 def execute_command(engine, cmd, cmd_args, args):
     if cmd not in COMMANDS:
         print_console(f"[red]Unknown command:[/red] {escape(cmd)}", args.quiet)
         return
 
+    spec = COMMANDS[cmd]
     if cmd == "exit":
-        print_console("[magenta]Goodbye![/magenta]", args.quiet)
-        exit(0)
-
-    if cmd == "version":
-        show_version()
+        return EXIT_REQUESTED
+    runtime = _prepare_command_runtime(cmd, list(cmd_args), args)
+    if runtime is None:
         return
 
-    if cmd == "help":
-        show_help()
+    if spec.prepares_output_file:
+        determine_output_file(cmd, args, runtime.command_args)
+
+    if not spec.validate(cmd, runtime.command_args, args):
         return
 
-    determine_output_file(cmd, args, cmd_args)
-    func = COMMANDS[cmd]
+    usage_command = None
+    if spec.tracked:
+        usage_command = engine.usage_command(
+            cmd,
+            target=spec.usage_target(runtime.command_args),
+            display_name=spec.usage_display_name(cmd, runtime.command_args),
+        )
 
-    if cmd in ("review_patch", "review_file", "update"):
-        func(engine, cmd_args[0], args)
-    elif cmd == "ask":
-        func(engine, " ".join(cmd_args))
-    elif cmd == "index":
-        func(engine, args.verbose, args.quiet)
-    elif cmd == "review_code":
-        func(engine, args)
+    if usage_command is None:
+        spec.invoke(engine, runtime.command_args, args, runtime)
+        return
+
+    with usage_command as command:
+        spec.invoke(engine, runtime.command_args, args, runtime)
+
+    record = engine.finalize_usage_command(command)
+    print_usage_summary(
+        record["display_name"],
+        record["summary"],
+        record["cumulative"],
+        quiet=args.quiet,
+    )
+
+
+def run_non_interactive(engine, args):
+    args.quiet = not args.verbose
+    if not args.command:
+        print_console(
+            "[red]Error:[/red] --command is required in non-interactive mode.",
+            args.quiet,
+        )
+        return 1, None
+    parts = args.command.strip().split()
+    cmd, cmd_args = parts[0], parts[1:]
+    try:
+        result = execute_command(engine, cmd, cmd_args, args)
+    except Exception as e:
+        print_console(f"[bold red]Error:[/bold red] {escape(str(e))}", args.quiet)
+        return 1, None
+    farewell = "[magenta]Goodbye![/magenta]" if result is EXIT_REQUESTED else None
+    return 0, farewell
+
+
+def run_interactive_loop(engine, args, vector_backend):
+    print_console(
+        "[bold cyan]Metis CLI. Type 'help' for usage, 'exit' to quit.[/bold cyan]",
+        args.quiet,
+    )
+    history = InMemoryHistory()
+
+    while True:
+        try:
+            user_input = prompt("> ", completer=completer, history=history).strip()
+            if not user_input:
+                continue
+            parts = user_input.split()
+            cmd, cmd_args = parts[0], parts[1:]
+
+            if PG_SUPPORTED and isinstance(vector_backend, PGVectorStoreImpl):
+                if cmd == "index" and vector_backend.check_project_schema_exists():
+                    print_console(
+                        "[red]Schema exists. Cannot re-index.[/red]", args.quiet
+                    )
+                    continue
+                if (
+                    cmd in {"ask", "review_code", "review_file"}
+                    and not _interactive_command_ignores_index(cmd, cmd_args, args)
+                    and not vector_backend.check_project_schema_exists()
+                ):
+                    print_console(
+                        "[red]Schema missing. Did you forget to index?[/red]",
+                        args.quiet,
+                    )
+                    continue
+
+            result = execute_command(engine, cmd, cmd_args, args)
+            if result is EXIT_REQUESTED:
+                return "[magenta]Goodbye![/magenta]"
+
+        except (EOFError, KeyboardInterrupt):
+            return "\n[magenta]Bye![/magenta]"
+        except Exception as e:
+            print_console(f"[bold red]Error:[/bold red] {escape(str(e))}", args.quiet)
 
 
 def main():
@@ -158,6 +351,21 @@ def main():
         type=str,
         help="Command to run in non-interactive mode (e.g., 'review_patch file.patch')",
     )
+    parser.add_argument(
+        "--triage",
+        action="store_true",
+        help="After review commands, triage findings and annotate SARIF output.",
+    )
+    parser.add_argument(
+        "--include-triaged",
+        action="store_true",
+        help="Include findings already triaged by Metis when running triage.",
+    )
+    parser.add_argument(
+        "--ignore-index",
+        action="store_true",
+        help="Allow selected analysis commands to run without an index-backed context.",
+    )
 
     args = parser.parse_args()
 
@@ -174,107 +382,22 @@ def main():
             False,
         )
         exit(1)
+    if args.version:
+        COMMANDS["version"].invoke(None, [], args)
+        return
+
     configure_logger(logger, args)
     runtime = load_runtime_config(enable_psql=(args.backend == "postgres"))
+    engine, vector_backend = build_engine(args, runtime)
+    exit_code = 0
+    farewell = None
+    try:
+        if args.non_interactive:
+            exit_code, farewell = run_non_interactive(engine, args)
+            return
 
-    # Construct the correct provider from runtime config
-    llm_provider_name = runtime.get("llm_provider_name", "openai")
-    provider_cls = get_provider(llm_provider_name)
-    llm_provider = provider_cls(runtime)
-
-    embed_model_code = llm_provider.get_embed_model_code()
-    embed_model_docs = llm_provider.get_embed_model_docs()
-
-    if args.backend == "postgres":
-        vector_backend = build_pg_backend(
-            args, runtime, embed_model_code, embed_model_docs
-        )
-    else:
-        vector_backend = build_chroma_backend(
-            args, runtime, embed_model_code, embed_model_docs
-        )
-
-    # Resolve custom analysis prompt text
-    custom_prompt_text = None
-    if args.custom_prompt:
-        pf = Path(args.custom_prompt)
-        if pf.is_file() and pf.suffix.lower() in {".md", ".txt"}:
-            custom_prompt_text = read_file_content(str(pf))
-        else:
-            print_console(
-                f"[yellow]Warning:[/yellow] Ignoring --custom-prompt '{escape(str(pf))}'. It must exist and have .md or .txt extension.",
-                args.quiet,
-            )
-    if custom_prompt_text is None:
-        # Fallback to .metis.md in project root (codebase path)
-        metis_md = Path(args.codebase_path) / ".metis.md"
-        if metis_md.is_file():
-            custom_prompt_text = read_file_content(str(metis_md))
-
-    engine = MetisEngine(
-        codebase_path=args.codebase_path,
-        llm_provider=llm_provider,
-        vector_backend=vector_backend,
-        custom_prompt_text=custom_prompt_text,
-        **runtime,
-    )
-
-    if args.version:
-        show_version()
-        exit(0)
-
-    if args.non_interactive:
-        # In non-interactive mode, only print detailed output when --verbose is set
-        args.quiet = not args.verbose
-        if not args.command:
-            print_console(
-                "[red]Error:[/red] --command is required in non-interactive mode.",
-                args.quiet,
-            )
-            exit(1)
-        parts = args.command.strip().split()
-        cmd, cmd_args = parts[0], parts[1:]
-        try:
-            execute_command(engine, cmd, cmd_args, args)
-        except Exception as e:
-            print_console(f"[bold red]Error:[/bold red] {escape(str(e))}", args.quiet)
-            exit(1)
-        exit(0)
-
-    print_console(
-        "[bold cyan]Metis CLI. Type 'help' for usage, 'exit' to quit.[/bold cyan]",
-        args.quiet,
-    )
-    history = InMemoryHistory()
-
-    while True:
-        try:
-            user_input = prompt("> ", completer=completer, history=history).strip()
-            if not user_input:
-                continue
-            parts = user_input.split()
-            cmd, cmd_args = parts[0], parts[1:]
-
-            if PG_SUPPORTED and isinstance(vector_backend, PGVectorStoreImpl):
-                if cmd == "index" and vector_backend.check_project_schema_exists():
-                    print_console(
-                        "[red]Schema exists. Cannot re-index.[/red]", args.quiet
-                    )
-                    continue
-                elif (
-                    cmd in {"ask", "review_code", "review_file"}
-                    and not vector_backend.check_project_schema_exists()
-                ):
-                    print_console(
-                        "[red]Schema missing. Did you forget to index?[/red]",
-                        args.quiet,
-                    )
-                    continue
-
-            execute_command(engine, cmd, cmd_args, args)
-
-        except (EOFError, KeyboardInterrupt):
-            print_console("\n[magenta]Bye![/magenta]", args.quiet)
-            break
-        except Exception as e:
-            print_console(f"[bold red]Error:[/bold red] {escape(str(e))}", args.quiet)
+        farewell = run_interactive_loop(engine, args, vector_backend)
+    finally:
+        finalize_cli_session_and_close(engine, args, farewell)
+    if exit_code:
+        raise SystemExit(exit_code)

@@ -35,17 +35,20 @@ The tool is named after **Metis**, the Greek goddess of wisdom, deep thought and
 
 Metis includes support for the following languages:
 
-| Language   | Status | Notes            |
-|------------|--------|------------------|
-| C          | Stable | Built-in plugin  |
-| C++        | Stable | Built-in plugin  |
-| Python     | Stable | Built-in plugin  |
-| Rust       | Stable | Built-in plugin  |
-| TypeScript | Stable | Built-in plugin  |
-| Terraform  | Stable | Built-in plugin  |
-| Go         | Stable | Built-in plugin  |
-| Solidity   | Stable | Built-in plugin  |
-| TableGen   | Stable | Built-in plugin  |
+| Language   | Triage Analysis                          | Notes            |
+|------------|------------------------------------------|------------------|
+| C          | Tree-sitter + Flow Analysis + tools      | Built-in plugin  |
+| C++        | Tree-sitter + Flow Analysis + tools      | Built-in plugin  |
+| Python     | Tree-sitter + Structural Analysis + tools| Built-in plugin  |
+| Rust       | Tree-sitter + Structural Analysis + tools| Built-in plugin  |
+| TypeScript | Tree-sitter + Structural Analysis + tools| Built-in plugin  |
+| Terraform  | Tools                                    | Built-in plugin  |
+| Go         | Tree-sitter + Structural Analysis + tools| Built-in plugin  |
+| Solidity   | Tree-sitter + Structural Analysis + tools| Built-in plugin  |
+| TableGen   | Tools                                    | Built-in plugin  |
+| Verilog    | Tree-sitter + Structural Analysis + tools| Built-in plugin  |
+
+For triage analysis details (`Flow Analysis` vs `Structural Analysis`), see [docs/triage-flow.md](docs/triage-flow.md).
 
 Metis uses a plugin-based language system, making it easy to extend support to additional languages.
 
@@ -78,6 +81,16 @@ To install with **PostgreSQL (pgvector)** backend support:
 uv pip install '.[postgres]'
 ```
 
+### 1.1 **Docker**
+
+```bash
+git clone https://github.com/arm/metis.git
+
+cd metis
+
+docker build -t metis .
+```
+
 ### 2. **Set up LLM Provider**
 
 **OpenAI**
@@ -104,6 +117,30 @@ Finally, run the security analysis across the entire codebase with:
 ```
 review_code
 ```
+
+If the index is unavailable and you still want to run an analysis, use:
+```
+review_code --ignore-index
+```
+This is supported only for `review_code`, `review_file`, `review_patch`, and `triage`. In that mode Metis skips retrieval and warns that relevant-context lookup was disabled.
+
+### 3.1 Docker
+
+Go to your codebase path and run:
+```bash
+docker run --rm -it -v `pwd`:/metis metis
+```
+
+To pass environment variables use `-e`:
+```bash
+docker run --rm -it -v `pwd`:/metis -e "OPENAI_API_KEY=${OPENAI_API_KEY}" metis
+```
+
+You can pass arguments to metis:
+```bash
+docker run --rm -it -v `pwd`:/metis metis --non-interactive --command 'review_code' --output-file results/review_code_results.json
+```
+
 ## Configuration
 
 **Metis Configuration (`metis.yaml`)**
@@ -157,6 +194,9 @@ Metis provides an interactive CLI with several built-in commands. After launchin
 - `--custom-prompt PATH` – optional `.md` or `.txt` file that contains additional guidance. When provided, Metis loads it once and weaves the text into every security-review prompt. If the flag is omitted, Metis looks for `.metis.md` in your project root and uses it when present. Use this to inject organization-specific policy or security requirements without editing `plugins.yaml`.
 - `--backend chroma|postgres` – choose vector-store backend (default `chroma`).
 - `--project-schema` / `--chroma-dir` – backend-specific knobs.
+- `--triage` – after `review_code`, `review_file`, or `review_patch`, triage findings and annotate SARIF output.
+- `--include-triaged` – include findings already triaged by Metis when running triage.
+- `--ignore-index` – allow `review_code`, `review_file`, `review_patch`, and `triage` to run without index-backed context. Metis warns and skips retrieval in this mode. It does not apply to `ask` or `update`.
 - `--verbose`, `--quiet`, `--output-file`, `--output-files` – control logging and export formats.
 
 ### `index`
@@ -164,18 +204,27 @@ Indexes your codebase into a vector database. Must be run before any analysis.
 
 ### `review_code`
 Performs a full security review of the indexed codebase.
+Use `--ignore-index` to run without retrieval when no index is available.
 
 ### `review_file <path>`
 Performs a targeted security review of a single file.
+Use `--ignore-index` to run without retrieval when no index is available.
 
 ### `review_patch <patch.diff>`
 Reviews a diff/patch file and highlights potential security issues introduced by the change.
+Use `--ignore-index` to run without retrieval when no index is available.
 
 ### `update <patch.diff>`
 Incrementally updates the index using a diff. Avoids full reindexing.
 
 ### `ask <question>`
 Ask Metis anything about the indexed codebase. Useful for exploring architecture, identifying design patterns, or clarifying logic.
+
+### `triage <findings.sarif>`
+Triages findings in a SARIF file and annotates each result with Metis triage metadata.
+You can use this command on SARIF generated by Metis or by other security/static-analysis tools.
+Use `--ignore-index` to triage without retrieval when no index is available.
+See [docs/triage-flow.md](docs/triage-flow.md) for a short overview of how triage works.
 
 ## Running in Non-Interactive Mode
 
@@ -262,24 +311,38 @@ Confidence: 1.0
 metis --non-interactive --command "review_code" --output-file results/full_review.json
 ```
 
-
-#### Example 5: Use of metis.yml
-
-```yaml
-# metis.yaml
-metis_engine:
-  metisignore_file: .metisignore # you can also use .gitignore
-
-llm_provider:
-  name: "ollama"
-  model: "llama3.1"
-  base_url: "http://localhost:11434/v1"
-  code_embedding_model: "all-minilm"
-  docs_embedding_model: "all-minilm"
-```
+#### Example 5: Review and auto-triage findings into SARIF
 
 ```bash
-uv run metis --codebase-path src -v  --log-level DEBUG
+metis --non-interactive \
+  --triage \
+  --command "review_patch changes.diff" \
+  --output-file results/review.json \
+  --output-file results/review.sarif
+```
+
+#### Example 6: Triage an existing SARIF file in place
+
+```bash
+metis --non-interactive --command "triage results/review.sarif"
+```
+
+#### Example 7: Review without index-backed retrieval
+
+```bash
+metis --non-interactive \
+  --ignore-index \
+  --command "review_code" \
+  --output-file results/full_review.json
+```
+
+#### Example 8: Triage an existing SARIF file into a new output file
+
+```bash
+metis --non-interactive \
+  --include-triaged \
+  --output-file results/retriaged.sarif \
+  --command "triage results/review.sarif"
 ```
 
 
