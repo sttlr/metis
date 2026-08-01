@@ -234,7 +234,7 @@ class MetisEngine:
         )
 
     def _get_review_graph(self):
-        if self._state._review_graph is None:
+        if self._state.review_graph is None:
             tools = create_langchain_tools(
                 self.codebase_path,
                 self.load_metisignore(),
